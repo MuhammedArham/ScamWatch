@@ -1,4 +1,4 @@
-export type AppStage = "home" | "incoming" | "call" | "scoring" | "results";
+export type AppStage = "home" | "incoming" | "call" | "scoring" | "results" | "history";
 
 export type Behaviour =
   | "shared_or_agreed_sensitive_info"
@@ -35,4 +35,23 @@ export interface ScamAssessment {
   strengths: string[];
   risks: string[];
   feedback: string;
+}
+
+export interface TrainingProfile {
+  preferredName: string;
+  city: string;
+}
+
+export interface AttemptSummary {
+  id: string;
+  timestamp: number;
+  score: number;
+  behaviours: Pick<ScamAssessment,
+    | "shared_or_agreed_sensitive_info"
+    | "agreed_to_transfer"
+    | "agreed_to_remote_access"
+    | "resisted_urgency"
+    | "independent_verification"
+    | "ended_suspicious_contact"
+  >;
 }

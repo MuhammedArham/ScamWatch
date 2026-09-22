@@ -7,9 +7,11 @@ import HomeScreen from "@/components/HomeScreen";
 import IncomingCall from "@/components/IncomingCall";
 import LiveCall from "@/components/LiveCall";
 import ResultsScreen from "@/components/ResultsScreen";
+import TrainingHistory from "@/components/TrainingHistory";
 import { addFinalTranscriptEvent } from "@/lib/transcript";
 import { calculateScore } from "@/lib/score";
-import type { AppStage, CallEndReason, ScamAssessment, TranscriptEntry } from "@/lib/types";
+import { HISTORY_KEY, PROFILE_KEY, makeAttemptSummary, parseHistory } from "@/lib/trainingHistory";
+import type { AppStage, AttemptSummary, CallEndReason, ScamAssessment, TrainingProfile, TranscriptEntry } from "@/lib/types";
 
 const agentId = process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID?.trim();
 
@@ -44,6 +46,11 @@ function ScamSafeExperience() {
   const [seconds, setSeconds] = useState(0);
   const [isEnding, setIsEnding] = useState(false);
   const [scoringFailed, setScoringFailed] = useState(false);
+  const [profile, setProfile] = useState<TrainingProfile>({ preferredName: "", city: "" });
+  const [rememberProfile, setRememberProfile] = useState(false);
+  const [hasSavedProfile, setHasSavedProfile] = useState(false);
+  const [attempts, setAttempts] = useState<AttemptSummary[]>([]);
+  const [completedAt, setCompletedAt] = useState(0);
 
   const mountedRef = useRef(false);
   const acceptLockRef = useRef(false);
@@ -60,6 +67,70 @@ function ScamSafeExperience() {
   const scoreStartedRef = useRef(false);
   const generationRef = useRef(0);
   const conversationIdRef = useRef<string | null>(null);
+  const attemptsRef = useRef<AttemptSummary[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    queueMicrotask(() => {
+      if (!active) return;
+      try {
+        const savedProfile = localStorage.getItem(PROFILE_KEY);
+        if (savedProfile) {
+          const parsed = z.strictObject({ preferredName: z.string().max(40), city: z.string().max(60) }).safeParse(JSON.parse(savedProfile));
+          if (parsed.success) {
+            setProfile(parsed.data);
+            setRememberProfile(true);
+            setHasSavedProfile(true);
+          }
+        }
+        attemptsRef.current = parseHistory(localStorage.getItem(HISTORY_KEY));
+        setAttempts(attemptsRef.current);
+      } catch {
+        // Storage can be unavailable in private browsing; the exercise still works.
+      }
+    });
+    return () => { active = false; };
+  }, []);
+
+  const updateProfile = (next: TrainingProfile) => {
+    const safe = {
+      preferredName: next.preferredName.replace(/[^\p{L}\p{M}\s'-]/gu, "").slice(0, 40),
+      city: next.city.replace(/[^\p{L}\p{M}\s'-]/gu, "").slice(0, 60),
+    };
+    setProfile(safe);
+    if (rememberProfile) {
+      try {
+        localStorage.setItem(PROFILE_KEY, JSON.stringify(safe));
+        setHasSavedProfile(true);
+      } catch { /* Keep this profile in memory only. */ }
+    }
+  };
+
+  const changeRememberProfile = (remember: boolean) => {
+    setRememberProfile(remember);
+    try {
+      if (remember) {
+        localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+        setHasSavedProfile(true);
+      } else {
+        localStorage.removeItem(PROFILE_KEY);
+        setHasSavedProfile(false);
+      }
+    } catch { /* Storage is optional. */ }
+  };
+
+  const clearSavedProfile = () => {
+    try { localStorage.removeItem(PROFILE_KEY); } catch { /* Storage is optional. */ }
+    setProfile({ preferredName: "", city: "" });
+    setRememberProfile(false);
+    setHasSavedProfile(false);
+  };
+
+  const clearHistory = () => {
+    try { localStorage.removeItem(HISTORY_KEY); } catch { /* Storage is optional. */ }
+    attemptsRef.current = [];
+    setAttempts([]);
+  };
 
   const clearEndFallback = useCallback(() => {
     if (endFallbackRef.current !== null) clearTimeout(endFallbackRef.current);
@@ -78,6 +149,7 @@ function ScamSafeExperience() {
     acceptLockRef.current = false;
     clearEndFallback();
     completedTranscriptRef.current = transcriptRef.current;
+    setCompletedAt(Date.now());
     recordEndReason(reason);
     setIsStarting(false);
     setIsEnding(false);
@@ -167,6 +239,11 @@ function ScamSafeExperience() {
         throw new Error("Invalid assessment");
       }
       if (!mountedRef.current || generation !== generationRef.current) return;
+      const localId = crypto.randomUUID?.() ?? String(Date.now()) + "-" + Math.random().toString(36).slice(2);
+      const summary = makeAttemptSummary(parsed.data, localId, Date.now());
+      attemptsRef.current = [summary, ...attemptsRef.current].slice(0, 50);
+      setAttempts(attemptsRef.current);
+      try { localStorage.setItem(HISTORY_KEY, JSON.stringify(attemptsRef.current)); } catch { /* Keep summaries in memory. */ }
       setAssessment(parsed.data);
       setStage("results");
     } catch {
@@ -263,7 +340,10 @@ function ScamSafeExperience() {
     setStage("call");
     activeCallRef.current = true;
     try {
-      startSession({ agentId });
+      const dynamicVariables: Record<string, string> = {};
+      if (profile.preferredName.trim()) dynamicVariables.preferred_name = profile.preferredName.trim();
+      if (profile.city.trim()) dynamicVariables.city = profile.city.trim();
+      startSession({ agentId, ...(Object.keys(dynamicVariables).length ? { dynamicVariables } : {}) });
     } catch {
       completeCall("connection_error");
     }
@@ -294,6 +374,7 @@ function ScamSafeExperience() {
     endingRef.current = false;
     completedRef.current = false;
     endReasonRef.current = null;
+    setCompletedAt(0);
     setAssessment(null);
     setTranscript([]);
     setIncomingError(null);
@@ -309,13 +390,19 @@ function ScamSafeExperience() {
     isEnding || (status === "disconnected" && connectedAt !== null)
       ? "Call ended"
       : status === "connected"
-        ? isSpeaking ? "Scammer speaking" : "Listening to you"
+        ? isSpeaking ? "Jess is speaking" : "Listening to you"
         : "Connecting...";
 
   return (
-    <main className="min-h-screen bg-slate-950 px-4 py-5 text-slate-950 sm:px-8 sm:py-8">
-      <div className="mx-auto flex min-h-[calc(100vh-2.5rem)] max-w-6xl items-center justify-center sm:min-h-[calc(100vh-4rem)]">
-        {stage === "home" && <HomeScreen onStart={() => setStage("incoming")} />}
+    <main className={stage === "history" ? "min-h-dvh bg-[#faf8ef] text-[#272727]" : "min-h-screen bg-[#aeb6c2] px-4 py-5 text-[#272727] sm:px-8 sm:py-8"}>
+      <div className={stage === "history" ? "min-h-dvh w-full" : "mx-auto flex min-h-[calc(100vh-2.5rem)] max-w-6xl items-center justify-center sm:min-h-[calc(100vh-4rem)]"}>
+        {stage === "home" && (
+          <HomeScreen onStart={() => setStage("incoming")} onHistory={() => setStage("history")}
+            profile={profile} onProfileChange={updateProfile} rememberProfile={rememberProfile}
+            onRememberChange={changeRememberProfile} onClearProfile={clearSavedProfile}
+            hasSavedProfile={hasSavedProfile} />
+        )}
+        {stage === "history" && <TrainingHistory attempts={attempts} onBack={startAgain} onClear={clearHistory} />}
         {stage === "incoming" && (
           <IncomingCall
             onAccept={acceptCall}
@@ -343,7 +430,9 @@ function ScamSafeExperience() {
           />
         )}
         {stage === "results" && assessment && (
-          <ResultsScreen results={assessment} onTryAgain={startAgain} />
+          <ResultsScreen results={assessment} onTryAgain={startAgain} onBackHome={startAgain}
+            onDashboard={() => setStage("history")}
+            transcript={transcript} completedAt={completedAt} />
         )}
       </div>
     </main>
@@ -361,9 +450,9 @@ function ScoringScreen({
 }) {
   return (
     <section aria-labelledby="scoring-heading" aria-live="polite"
-      className="w-full max-w-xl rounded-[2rem] bg-white px-8 py-16 text-center shadow-2xl sm:px-14">
-      {!failed && <div className="mx-auto mb-7 h-14 w-14 animate-spin rounded-full border-4 border-sky-100 border-t-sky-700 motion-reduce:animate-none" aria-hidden="true" />}
-      <p className="mb-3 text-lg font-bold uppercase tracking-[0.16em] text-sky-800">Training simulation</p>
+      className="w-full max-w-xl rounded-[2.5rem] border border-white/70 bg-[#faf8ef] px-8 py-16 text-center shadow-2xl sm:px-14">
+      {!failed && <div className="mx-auto mb-7 h-14 w-14 animate-spin rounded-full border-4 border-[#eee8d5] border-t-[#333333] motion-reduce:animate-none" aria-hidden="true" />}
+      <p className="mb-3 text-lg font-bold uppercase tracking-[0.16em] text-[#514b38]">Training simulation</p>
       <h1 id="scoring-heading" className="text-4xl font-bold tracking-tight text-slate-950 sm:text-5xl">
         {failed ? "We couldn't generate your personalised feedback this time." : "Reviewing your response..."}
       </h1>
@@ -375,11 +464,11 @@ function ScoringScreen({
       {failed && (
         <div className="mt-10 space-y-4">
           <button type="button" onClick={onRetry}
-            className="min-h-18 w-full rounded-2xl bg-sky-700 px-6 py-4 text-xl font-bold text-white focus-visible:outline-4 focus-visible:outline-offset-4 focus-visible:outline-sky-700">
+            className="min-h-18 w-full rounded-2xl bg-[#ffd866] px-6 py-4 text-xl font-bold text-[#272727] hover:bg-[#f5c84a] focus-visible:outline-4 focus-visible:outline-offset-4 focus-visible:outline-[#272727]">
             Try scoring again
           </button>
           <button type="button" onClick={onStartAgain}
-            className="min-h-18 w-full rounded-2xl border-2 border-slate-800 px-6 py-4 text-xl font-bold text-slate-950 focus-visible:outline-4 focus-visible:outline-offset-4 focus-visible:outline-sky-700">
+            className="min-h-18 w-full rounded-2xl border-2 border-[#333333] px-6 py-4 text-xl font-bold text-[#272727] focus-visible:outline-4 focus-visible:outline-offset-4 focus-visible:outline-[#272727]">
             Start another simulation
           </button>
         </div>
