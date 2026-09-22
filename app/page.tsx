@@ -9,9 +9,16 @@ import LiveCall from "@/components/LiveCall";
 import ResultsScreen from "@/components/ResultsScreen";
 import { addFinalTranscriptEvent } from "@/lib/transcript";
 import { calculateScore } from "@/lib/score";
+import { MAX_RISK_TRANSCRIPT_CHARS, calculateRisk, redFlagNames } from "@/lib/risk";
+import type { RiskAssessment } from "@/lib/risk";
 import type { AppStage, CallEndReason, ScamAssessment, TranscriptEntry } from "@/lib/types";
 
 const agentId = process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID?.trim();
+
+// The live guard sends at most one request at a time, and never faster than this.
+const RISK_MIN_INTERVAL_MS = 3_000;
+const SPOKEN_HIGH_RISK_WARNING =
+  "Warning. This call looks like a scam. Do not share any codes or card numbers. You can hang up now.";
 
 const assessmentSchema = z.strictObject({
   shared_or_agreed_sensitive_info: z.boolean(),
@@ -25,6 +32,40 @@ const assessmentSchema = z.strictObject({
   risks: z.array(z.string()),
   feedback: z.string(),
 });
+
+const riskSchema = z.strictObject({
+  risk: z.enum(["low", "medium", "high"]),
+  red_flags: z.array(z.enum(redFlagNames)),
+  reason: z.string().min(1),
+});
+
+function formatTranscriptForRisk(entries: TranscriptEntry[]): string {
+  return entries
+    .map((entry) => `${entry.role === "agent" ? "Caller" : "User"}: ${entry.text}`)
+    .join("\n")
+    .slice(-MAX_RISK_TRANSCRIPT_CHARS);
+}
+
+function speakHighRiskWarning() {
+  try {
+    const synthesis = window.speechSynthesis;
+    if (!synthesis) return;
+    const utterance = new SpeechSynthesisUtterance(SPOKEN_HIGH_RISK_WARNING);
+    utterance.rate = 0.9;
+    synthesis.cancel();
+    synthesis.speak(utterance);
+  } catch (error) {
+    console.error("Spoken scam warning failed", error);
+  }
+}
+
+function stopSpokenWarning() {
+  try {
+    window.speechSynthesis?.cancel();
+  } catch {
+    // Speech synthesis is optional; a failure here must never affect the call.
+  }
+}
 
 export default function Home() {
   return (
@@ -44,6 +85,7 @@ function ScamSafeExperience() {
   const [seconds, setSeconds] = useState(0);
   const [isEnding, setIsEnding] = useState(false);
   const [scoringFailed, setScoringFailed] = useState(false);
+  const [risk, setRisk] = useState<RiskAssessment | null>(null);
 
   const mountedRef = useRef(false);
   const acceptLockRef = useRef(false);
@@ -61,9 +103,22 @@ function ScamSafeExperience() {
   const generationRef = useRef(0);
   const conversationIdRef = useRef<string | null>(null);
 
+  const riskCheckRef = useRef<() => void>(() => {});
+  const riskInFlightRef = useRef(false);
+  const riskQueuedRef = useRef(false);
+  const riskLastSentAtRef = useRef(0);
+  const riskTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const riskControllerRef = useRef<AbortController | null>(null);
+  const spokenHighRiskRef = useRef(false);
+
   const clearEndFallback = useCallback(() => {
     if (endFallbackRef.current !== null) clearTimeout(endFallbackRef.current);
     endFallbackRef.current = null;
+  }, []);
+
+  const clearRiskTimer = useCallback(() => {
+    if (riskTimerRef.current !== null) clearTimeout(riskTimerRef.current);
+    riskTimerRef.current = null;
   }, []);
 
   const recordEndReason = useCallback((reason: CallEndReason) => {
@@ -77,12 +132,85 @@ function ScamSafeExperience() {
     connectedRef.current = false;
     acceptLockRef.current = false;
     clearEndFallback();
+    clearRiskTimer();
+    riskQueuedRef.current = false;
+    riskControllerRef.current?.abort();
+    riskControllerRef.current = null;
     completedTranscriptRef.current = transcriptRef.current;
     recordEndReason(reason);
     setIsStarting(false);
     setIsEnding(false);
     setStage("scoring");
-  }, [clearEndFallback, recordEndReason]);
+  }, [clearEndFallback, clearRiskTimer, recordEndReason]);
+
+  // Live scam guard. Runs after each new agent turn, one request at a time,
+  // never more often than RISK_MIN_INTERVAL_MS. A failure keeps the last
+  // known risk so the call itself is never interrupted.
+  const checkRisk = useCallback(() => {
+    if (!mountedRef.current || !activeCallRef.current || completedRef.current) return;
+    if (riskInFlightRef.current) {
+      riskQueuedRef.current = true;
+      return;
+    }
+    const wait = RISK_MIN_INTERVAL_MS - (Date.now() - riskLastSentAtRef.current);
+    if (wait > 0) {
+      if (riskTimerRef.current === null) {
+        riskTimerRef.current = setTimeout(() => {
+          riskTimerRef.current = null;
+          riskCheckRef.current();
+        }, wait);
+      }
+      return;
+    }
+    const text = formatTranscriptForRisk(transcriptRef.current);
+    if (!text) return;
+
+    riskInFlightRef.current = true;
+    riskLastSentAtRef.current = Date.now();
+    const generation = generationRef.current;
+    const controller = new AbortController();
+    riskControllerRef.current = controller;
+
+    void (async () => {
+      try {
+        const response = await fetch("/api/risk", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ transcript: text }),
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`Risk check failed with status ${response.status}`);
+        const parsed = riskSchema.safeParse(await response.json());
+        if (!parsed.success || parsed.data.risk !== calculateRisk(parsed.data.red_flags)) {
+          throw new Error("Invalid risk assessment");
+        }
+        if (!mountedRef.current || generation !== generationRef.current) return;
+        setRisk(parsed.data);
+        if (parsed.data.risk === "high" && !spokenHighRiskRef.current) {
+          spokenHighRiskRef.current = true;
+          speakHighRiskWarning();
+        }
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          console.error("Live scam check failed", error);
+        }
+      } finally {
+        if (generation === generationRef.current) {
+          riskInFlightRef.current = false;
+          riskControllerRef.current = null;
+          if (riskQueuedRef.current) {
+            riskQueuedRef.current = false;
+            riskCheckRef.current();
+          }
+        }
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    riskCheckRef.current = checkRisk;
+  }, [checkRisk]);
 
   const { startSession, endSession, status, isSpeaking, getId } = useConversation({
     onConnect: () => {
@@ -121,6 +249,7 @@ function ScamSafeExperience() {
         timestamp: Date.now(),
       });
       setTranscript(transcriptRef.current);
+      if (role === "agent") riskCheckRef.current();
     },
     onAgentResponseCorrection: ({ original_agent_response, corrected_agent_response, event_id }) => {
       if (!mountedRef.current || !activeCallRef.current || completedRef.current) return;
@@ -183,6 +312,8 @@ function ScamSafeExperience() {
     mountedRef.current = true;
     const onPageHide = () => {
       scoreControllerRef.current?.abort();
+      riskControllerRef.current?.abort();
+      stopSpokenWarning();
       microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
       microphoneStreamRef.current = null;
       if (activeCallRef.current || acceptLockRef.current) {
@@ -197,7 +328,10 @@ function ScamSafeExperience() {
       mountedRef.current = false;
       window.removeEventListener("pagehide", onPageHide);
       clearEndFallback();
+      clearRiskTimer();
       scoreControllerRef.current?.abort();
+      riskControllerRef.current?.abort();
+      stopSpokenWarning();
       microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
       microphoneStreamRef.current = null;
       if (activeCallRef.current || acceptLockRef.current) {
@@ -207,7 +341,7 @@ function ScamSafeExperience() {
         endSession();
       }
     };
-  }, [clearEndFallback, endSession]);
+  }, [clearEndFallback, clearRiskTimer, endSession]);
 
   useEffect(() => {
     if (stage !== "call" || connectedAt === null) return;
@@ -226,6 +360,18 @@ function ScamSafeExperience() {
     if (stage === "scoring") void scoreCompletedCall();
   }, [stage, scoreCompletedCall]);
 
+  const resetLiveGuard = useCallback(() => {
+    clearRiskTimer();
+    riskControllerRef.current?.abort();
+    riskControllerRef.current = null;
+    riskInFlightRef.current = false;
+    riskQueuedRef.current = false;
+    riskLastSentAtRef.current = 0;
+    spokenHighRiskRef.current = false;
+    stopSpokenWarning();
+    setRisk(null);
+  }, [clearRiskTimer]);
+
   const acceptCall = async () => {
     if (stage !== "incoming" || acceptLockRef.current || connectedRef.current ||
         status === "connecting" || status === "connected" || !agentId) return;
@@ -237,6 +383,7 @@ function ScamSafeExperience() {
     transcriptRef.current = [];
     completedTranscriptRef.current = [];
     scoreStartedRef.current = false;
+    resetLiveGuard();
     setIncomingError(null);
     setIsStarting(true);
     setTranscript([]);
@@ -282,6 +429,7 @@ function ScamSafeExperience() {
     scoreControllerRef.current?.abort();
     scoreControllerRef.current = null;
     clearEndFallback();
+    resetLiveGuard();
     microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
     microphoneStreamRef.current = null;
     transcriptRef.current = [];
@@ -333,6 +481,7 @@ function ScamSafeExperience() {
             microphoneStatus={status === "connected" ? "on" : "connecting"}
             transcript={transcript}
             isEnding={isEnding}
+            risk={risk}
           />
         )}
         {stage === "scoring" && (
