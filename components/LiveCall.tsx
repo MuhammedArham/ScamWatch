@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import type { RiskAssessment } from "@/lib/risk";
 import type { TranscriptEntry } from "@/lib/types";
 
 type LiveCallProps = {
@@ -10,6 +11,8 @@ type LiveCallProps = {
   microphoneStatus: "on" | "connecting";
   transcript: TranscriptEntry[];
   isEnding: boolean;
+  risk: RiskAssessment | null;
+  isRiskStale: boolean;
 };
 
 export default function LiveCall({
@@ -19,6 +22,8 @@ export default function LiveCall({
   microphoneStatus,
   transcript,
   isEnding,
+  risk,
+  isRiskStale,
 }: LiveCallProps) {
   const [isTranscriptOpen, setIsTranscriptOpen] = useState(false);
 
@@ -28,6 +33,70 @@ export default function LiveCall({
 
   return (
     <section aria-labelledby="live-call-heading" className="w-full max-w-3xl rounded-[2rem] bg-white p-6 shadow-2xl sm:p-10 lg:p-12">
+      {risk?.risk === "high" && (
+        <div className="-mx-6 -mt-6 mb-7 sm:-mx-10 sm:-mt-10 lg:-mx-12 lg:-mt-12">
+          {/* Clipped, so however long the reason runs it cannot grow the banner
+              and shove the end-call button below the fold. */}
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="max-h-[45vh] overflow-hidden rounded-t-[2rem] bg-red-700 px-6 pt-7 text-white sm:px-10 sm:pt-9 lg:px-12"
+          >
+            <p className="flex items-center gap-3 text-xl font-bold uppercase tracking-[0.16em] sm:text-2xl">
+              <span aria-hidden="true" className="text-3xl leading-none">⚠</span>
+              Warning: this looks like a scam
+            </p>
+            <p className="mt-4 text-3xl font-bold leading-snug sm:text-4xl">{risk.reason}</p>
+            <p className="mt-4 text-xl font-semibold leading-relaxed sm:text-2xl">
+              Do not share any codes or card numbers.
+            </p>
+          </div>
+          {/* Outside the clipped container above: this button is never scrolled
+              or clipped away, whatever the model returned. */}
+          <div className="bg-red-700 px-6 pb-7 pt-6 sm:px-10 sm:pb-9 lg:px-12">
+            <button
+              type="button"
+              onClick={onEnd}
+              disabled={isEnding}
+              className="flex min-h-20 w-full items-center justify-center gap-3 rounded-2xl bg-white px-7 text-2xl font-bold text-red-800 shadow-lg transition hover:bg-red-50 focus-visible:outline-4 focus-visible:outline-offset-4 focus-visible:outline-white disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <span aria-hidden="true" className="text-3xl">×</span>
+              End call now
+            </button>
+          </div>
+        </div>
+      )}
+
+      {risk?.risk === "medium" && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="mb-7 max-h-[35vh] overflow-hidden rounded-2xl border-4 border-[#8A5A12] bg-[#FAEEDA] px-6 py-6 text-[#412402]"
+        >
+          <p className="flex items-center gap-3 text-xl font-bold uppercase tracking-[0.16em]">
+            <span aria-hidden="true" className="text-3xl leading-none">⚠</span>
+            Be careful
+          </p>
+          <p className="mt-3 text-3xl font-bold leading-snug">{risk.reason}</p>
+        </div>
+      )}
+
+      {/* A green badge is a claim we can only make from a recent check. Once the
+          checks go quiet we drop to neutral rather than keep promising safety. */}
+      {risk?.risk === "low" && !isRiskStale && (
+        <p role="status" aria-live="polite" className="mb-7 inline-flex items-center gap-3 rounded-full bg-emerald-100 px-5 py-3 text-lg font-bold text-emerald-950">
+          <span aria-hidden="true" className="h-4 w-4 rounded-full bg-emerald-700" />
+          Call safe so far
+        </p>
+      )}
+
+      {isRiskStale && risk?.risk !== "high" && risk?.risk !== "medium" && (
+        <p role="status" aria-live="polite" className="mb-7 inline-flex items-center gap-3 rounded-full bg-slate-200 px-5 py-3 text-lg font-bold text-slate-800">
+          <span aria-hidden="true" className="h-4 w-4 rounded-full bg-slate-500" />
+          Checking...
+        </p>
+      )}
+
       <div className="flex flex-col gap-6 border-b-2 border-slate-200 pb-7 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <p className="inline-flex items-center gap-2 rounded-full bg-amber-100 px-4 py-2 text-base font-bold text-slate-950">
