@@ -17,6 +17,11 @@ const agentId = process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID?.trim();
 
 // The live guard sends at most one request at a time, and never faster than this.
 const RISK_MIN_INTERVAL_MS = 3_000;
+// How long a successful check stays trustworthy. Agent turns can be far apart and
+// a check can hang or fail, so after this long with nothing confirmed we stop
+// claiming the call is safe and say we are still checking. We never escalate on
+// staleness alone: not knowing is not the same as having seen something bad.
+const RISK_STALE_MS = 15_000;
 const SPOKEN_HIGH_RISK_WARNING =
   "Warning. This call looks like a scam. Do not share any codes or card numbers. You can hang up now.";
 
@@ -86,6 +91,7 @@ function ScamSafeExperience() {
   const [isEnding, setIsEnding] = useState(false);
   const [scoringFailed, setScoringFailed] = useState(false);
   const [risk, setRisk] = useState<RiskAssessment | null>(null);
+  const [isRiskStale, setIsRiskStale] = useState(false);
 
   const mountedRef = useRef(false);
   const acceptLockRef = useRef(false);
@@ -110,6 +116,7 @@ function ScamSafeExperience() {
   const riskTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const riskControllerRef = useRef<AbortController | null>(null);
   const spokenHighRiskRef = useRef(false);
+  const riskLastSuccessAtRef = useRef(0);
 
   const clearEndFallback = useCallback(() => {
     if (endFallbackRef.current !== null) clearTimeout(endFallbackRef.current);
@@ -136,6 +143,9 @@ function ScamSafeExperience() {
     riskQueuedRef.current = false;
     riskControllerRef.current?.abort();
     riskControllerRef.current = null;
+    // The warning is about this call. Let it run past the hang-up and it talks
+    // over the results screen.
+    stopSpokenWarning();
     completedTranscriptRef.current = transcriptRef.current;
     recordEndReason(reason);
     setIsStarting(false);
@@ -186,6 +196,8 @@ function ScamSafeExperience() {
           throw new Error("Invalid risk assessment");
         }
         if (!mountedRef.current || generation !== generationRef.current) return;
+        riskLastSuccessAtRef.current = Date.now();
+        setIsRiskStale(false);
         setRisk(parsed.data);
         if (parsed.data.risk === "high" && !spokenHighRiskRef.current) {
           spokenHighRiskRef.current = true;
@@ -360,6 +372,20 @@ function ScamSafeExperience() {
     if (stage === "scoring") void scoreCompletedCall();
   }, [stage, scoreCompletedCall]);
 
+  // Only runs during a live call, so the interval is torn down on hang-up and no
+  // stale banner can survive into scoring or results.
+  useEffect(() => {
+    if (stage !== "call" || connectedAt === null) return;
+    const updateStaleness = () => {
+      if (!mountedRef.current) return;
+      const since = riskLastSuccessAtRef.current || connectedAt;
+      setIsRiskStale(Date.now() - since > RISK_STALE_MS);
+    };
+    updateStaleness();
+    const timer = window.setInterval(updateStaleness, 1_000);
+    return () => window.clearInterval(timer);
+  }, [stage, connectedAt]);
+
   const resetLiveGuard = useCallback(() => {
     clearRiskTimer();
     riskControllerRef.current?.abort();
@@ -367,9 +393,11 @@ function ScamSafeExperience() {
     riskInFlightRef.current = false;
     riskQueuedRef.current = false;
     riskLastSentAtRef.current = 0;
+    riskLastSuccessAtRef.current = 0;
     spokenHighRiskRef.current = false;
     stopSpokenWarning();
     setRisk(null);
+    setIsRiskStale(false);
   }, [clearRiskTimer]);
 
   const acceptCall = async () => {
@@ -482,6 +510,7 @@ function ScamSafeExperience() {
             transcript={transcript}
             isEnding={isEnding}
             risk={risk}
+            isRiskStale={isRiskStale}
           />
         )}
         {stage === "scoring" && (

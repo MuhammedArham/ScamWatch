@@ -1,13 +1,11 @@
 import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
-import { readBoundedBody, redactNumbers } from "@/lib/request";
-import { MAX_RISK_TRANSCRIPT_CHARS, calculateRisk, redFlagNames } from "@/lib/risk";
+import { readBoundedBody } from "@/lib/request";
+import { MAX_RISK_TRANSCRIPT_CHARS, calculateRisk, redFlagNames, sanitizeReason } from "@/lib/risk";
 import type { RedFlag, RiskAssessment } from "@/lib/risk";
 
 export const runtime = "nodejs";
-
-const MAX_REASON_WORDS = 40;
 
 const requestSchema = z.strictObject({
   transcript: z.string().min(1).max(MAX_RISK_TRANSCRIPT_CHARS),
@@ -29,7 +27,7 @@ const instructions = `You watch a live transcript from a safe scam-awareness tra
 Set each flag true only when the transcript supports it:
 asks_for_pin_or_otp: the caller asks for a one-time code, PIN, password, or security question answer.
 asks_for_card_or_bank_details: the caller asks for a card number, BSB, account number, or CVV.
-spoken_digits_detected: anyone reads out a run of digits one by one, including digits written as words such as "four two one nine". Numbers already replaced with [redacted number] also count.
+spoken_digits_detected: anyone reads out a run of digits one by one, including digits written as words such as "four two one nine".
 requests_money_transfer: the caller asks to move money, transfer funds, buy gift cards, send cryptocurrency, or wire money.
 requests_remote_access: the caller asks to install software, or to connect to or control the device, such as TeamViewer or AnyDesk.
 urgency_or_threats: the caller applies time pressure or threatens consequences such as account closure or arrest.
@@ -66,17 +64,21 @@ export async function POST(request: Request) {
       temperature: 0,
       input: [
         { role: "system", content: instructions },
-        { role: "user", content: redactNumbers(parsed.data.transcript) },
+        // Deliberately NOT redacted. redactNumbers replaces digit runs with a
+        // placeholder, which is right for /api/score because that runs after the
+        // call is over and only needs to judge behaviour. This route has to spot
+        // a caller reading card or code digits aloud, so redacting here would
+        // destroy the exact evidence spoken_digits_detected exists to find.
+        { role: "user", content: parsed.data.transcript },
       ],
       text: { format: zodTextFormat(flagsSchema, "scam_red_flags") },
     });
     const validated = flagsSchema.safeParse(response.output_parsed);
-    if (!validated.success || !validated.data.reason.trim() ||
-        validated.data.reason.trim().split(/\s+/).length > MAX_REASON_WORDS) {
-      return json({ error: "Live checking is temporarily unavailable." }, 502);
-    }
+    if (!validated.success) return json({ error: "Live checking is temporarily unavailable." }, 502);
+    const reason = sanitizeReason(validated.data.reason);
+    if (!reason) return json({ error: "Live checking is temporarily unavailable." }, 502);
     const redFlags: RedFlag[] = redFlagNames.filter((name) => validated.data[name]);
-    return json({ risk: calculateRisk(redFlags), red_flags: redFlags, reason: validated.data.reason.trim() });
+    return json({ risk: calculateRisk(redFlags), red_flags: redFlags, reason });
   } catch {
     return json({ error: "Live checking is temporarily unavailable." }, 502);
   }
